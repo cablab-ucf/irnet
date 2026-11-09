@@ -9,11 +9,13 @@ compile_error!("irnet needs a TLS backend: feature `aws-lc` (native) or `pure` (
 pub mod pq;
 pub mod psk;
 
-use iroh::endpoint::{AfterHandshakeOutcome, Builder, Connection, Endpoint, EndpointHooks};
-use iroh::endpoint::{PathEvent, QuicTransportConfig, presets};
-use iroh::{EndpointId, RelayMode, RelayUrl, TransportAddr, Watcher};
+use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, Builder, Connection, Endpoint};
+use iroh::endpoint::{EndpointHooks, PathEvent, QuicTransportConfig, presets};
+use iroh::{EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr, Watcher};
 use n0_future::StreamExt;
 use n0_future::time::{Duration, Instant, timeout};
+use noq_proto::crypto::rustls::HandshakeData;
+use rustls::NamedGroup;
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -33,13 +35,13 @@ pub fn relays() -> Vec<RelayUrl> {
     RELAYS.map(|r| r.parse().expect("static relay url")).into()
 }
 
-fn host(u: &RelayUrl) -> Option<&str> {
-    u.host_str().map(|h| h.trim_end_matches('.'))
+fn origin(u: &RelayUrl) -> (&str, Option<&str>, Option<u16>) {
+    (u.scheme(), u.host_str().map(|h| h.trim_end_matches('.')), u.port_or_known_default())
 }
 
-/// Whether `u` is one of [`RELAYS`], trailing dot or not.
+/// Whether `u` is one of [`RELAYS`] (scheme, host, port), trailing dot or not.
 fn lab(u: &RelayUrl) -> bool {
-    relays().iter().any(|r| host(r) == host(u))
+    relays().iter().any(|r| origin(r) == origin(u))
 }
 
 fn foreign(peer: EndpointId, a: &TransportAddr) {
@@ -50,14 +52,32 @@ fn foreign(peer: EndpointId, a: &TransportAddr) {
     }
 }
 
-/// Warns of each path through a relay not the lab's (n0's included): those
-/// a connection has at its handshake, and any it opens until it closes.
+/// The key exchange `c`'s handshake settled on.
+fn kx(c: &Connection) -> Option<NamedGroup> {
+    c.handshake_data()?.downcast::<HandshakeData>().ok()?.negotiated_key_exchange_group
+}
+
+/// Warns of each relay not the lab's (n0's included): those a dialed address
+/// names, before any is contacted; those a connection's paths cross at its
+/// handshake, and any it opens until it closes. Warns too of a handshake
+/// that is not post-quantum: a peer without X25519MLKEM768.
 #[derive(Debug)]
 struct Foreign;
 
 impl EndpointHooks for Foreign {
+    async fn before_connect(&self, to: &EndpointAddr, _: &[u8]) -> BeforeConnectOutcome {
+        for u in to.relay_urls().filter(|u| !lab(u)) {
+            warn!(peer = %to.id, relay = %u, "dialing through a relay not the lab's");
+        }
+        BeforeConnectOutcome::Accept
+    }
+
     async fn after_handshake(&self, c: &Connection) -> AfterHandshakeOutcome {
         let (peer, mut opened) = (c.remote_id(), c.path_events());
+        let kx = kx(c);
+        if kx != Some(NamedGroup::X25519MLKEM768) {
+            warn!(%peer, ?kx, "handshake not post-quantum");
+        }
         c.paths().iter().for_each(|p| foreign(peer, p.remote_addr()));
         // The event stream holds no handle, so the connection still closes on drop.
         n0_future::task::spawn(async move {
@@ -124,7 +144,9 @@ pub fn tls() -> Arc<CryptoProvider> {
     Arc::new(p)
 }
 
-/// 2 MiB stream windows (16 MB/s at 130 ms), BBRv3 for lossy paths.
+/// 2 MiB stream windows (16 MB/s at 130 ms), BBRv3 for lossy paths (noq
+/// calls it experimental; its other controllers, Cubic and NewReno, take
+/// loss for congestion).
 pub fn transport() -> QuicTransportConfig {
     let q = QuicTransportConfig::builder()
         .stream_receive_window((2u32 << 20).into())
@@ -137,7 +159,8 @@ pub fn transport() -> QuicTransportConfig {
 }
 
 /// The lab's relays (see [`fallback`]), no third-party lookup, no
-/// captive-portal probes; warns of each path through a relay not the lab's.
+/// captive-portal probes; warns of each relay not the lab's, dialed or on a
+/// path, and of each handshake not post-quantum.
 pub fn endpoint() -> Builder {
     let b = Endpoint::builder(presets::Empty)
         .crypto_provider(tls())
@@ -162,10 +185,12 @@ mod tests {
 
     #[test]
     fn handshakes_are_post_quantum() {
-        assert_eq!(tls().kx_groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(tls().kx_groups[0].name(), NamedGroup::X25519MLKEM768);
         assert_eq!(relays().len(), RELAYS.len());
         assert!(relays().iter().all(lab) && lab(&"https://iroh.cxn.center/".parse().unwrap()));
         assert!(!lab(&FALLBACK.parse().unwrap()));
+        assert!(!lab(&"http://iroh.cxn.center/".parse().unwrap()));
+        assert!(!lab(&"https://iroh.cxn.center:9/".parse().unwrap()));
     }
 
     /// The fallback joins only after the lab's relays fail for its grace.
@@ -203,6 +228,7 @@ mod tests {
             c.closed().await;
         });
         let c = a.connect(at, ALPN).await.unwrap();
+        assert_eq!(kx(&c), Some(NamedGroup::X25519MLKEM768));
         let (mut tx, mut rx) = c.open_bi().await.unwrap();
         tx.write_all(b"pq").await.unwrap();
         tx.finish().unwrap();
@@ -277,6 +303,31 @@ mod tests {
         let (_tx, mut rx) = psk::dial(&c, &[8; 32]).await.unwrap();
         assert_eq!(rx.recv(64).await.unwrap(), b"cut");
         assert!(rx.end().await.is_err());
+        c.close(0u32.into(), b"");
+        srv.await.unwrap();
+    }
+
+    /// A peer that stops reading fails `send` in time, not never.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn psk_send_fails_a_stalled_peer() {
+        const ALPN: &[u8] = b"irnet/psk";
+        let bind = || endpoint().alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind();
+        let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+        let (b2, at) = (b.clone(), b.addr());
+        let srv = tokio::spawn(async move {
+            let c = b2.accept().await.unwrap().await.unwrap();
+            let _held = psk::accept(&c, &[&[8; 32]]).await.unwrap();
+            c.closed().await;
+        });
+        let c = a.connect(at, ALPN).await.unwrap();
+        let (mut tx, _rx) = psk::dial(&c, &[8; 32]).await.unwrap();
+        let sent = async {
+            for _ in 0..8 {
+                tx.send(&[0; 1 << 20]).await?;
+            }
+            anyhow::Ok(())
+        };
+        assert!(format!("{:#}", sent.await.unwrap_err()).contains("stalled"));
         c.close(0u32.into(), b"");
         srv.await.unwrap();
     }

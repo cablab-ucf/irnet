@@ -1,5 +1,5 @@
-# By hand only (minutes are scarce): a run naming tag vX.Y.Z tests the
-# commit, then tags it and publishes a release of the source. The tests
+# By hand only (minutes are scarce): a run on main naming tag vX.Y.Z tests
+# the commit, then tags it and publishes a release of the source. The tests
 # hold a read-only token; the job that writes runs no build code.
 name: release
 on:
@@ -14,6 +14,7 @@ env:
 
 jobs:
   test:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
