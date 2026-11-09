@@ -10,8 +10,9 @@ pub mod pq;
 pub mod psk;
 
 use iroh::endpoint::{AfterHandshakeOutcome, Builder, Connection, Endpoint, EndpointHooks};
-use iroh::endpoint::{QuicTransportConfig, presets};
-use iroh::{RelayMode, RelayUrl, TransportAddr, Watcher};
+use iroh::endpoint::{PathEvent, QuicTransportConfig, presets};
+use iroh::{EndpointId, RelayMode, RelayUrl, TransportAddr, Watcher};
+use n0_future::StreamExt;
 use n0_future::time::{Duration, Instant, timeout};
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
@@ -32,27 +33,50 @@ pub fn relays() -> Vec<RelayUrl> {
     RELAYS.map(|r| r.parse().expect("static relay url")).into()
 }
 
-fn n0(u: &RelayUrl) -> bool {
-    u.host_str().is_some_and(|h| h.trim_end_matches('.').ends_with(".n0.iroh.link"))
+fn host(u: &RelayUrl) -> Option<&str> {
+    u.host_str().map(|h| h.trim_end_matches('.'))
 }
 
-/// Warns of each connection with a path through any of n0's relays at its handshake.
-#[derive(Debug)]
-struct N0;
+/// Whether `u` is one of [`RELAYS`], trailing dot or not.
+fn lab(u: &RelayUrl) -> bool {
+    relays().iter().any(|r| host(r) == host(u))
+}
 
-impl EndpointHooks for N0 {
+fn foreign(peer: EndpointId, a: &TransportAddr) {
+    if let TransportAddr::Relay(u) = a
+        && !lab(u)
+    {
+        warn!(%peer, relay = %u, "path through a relay not the lab's");
+    }
+}
+
+/// Warns of each path through a relay not the lab's (n0's included): those
+/// a connection has at its handshake, and any it opens until it closes.
+#[derive(Debug)]
+struct Foreign;
+
+impl EndpointHooks for Foreign {
     async fn after_handshake(&self, c: &Connection) -> AfterHandshakeOutcome {
-        if c.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Relay(u) if n0(u))) {
-            warn!(peer = %c.remote_id(), "connection relayed through n0's servers");
-        }
+        let (peer, mut opened) = (c.remote_id(), c.path_events());
+        c.paths().iter().for_each(|p| foreign(peer, p.remote_addr()));
+        // The event stream holds no handle, so the connection still closes on drop.
+        n0_future::task::spawn(async move {
+            while let Some(e) = opened.next().await {
+                if let PathEvent::Opened { remote_addr, .. } = e {
+                    foreign(peer, &remote_addr);
+                }
+            }
+        });
         AfterHandshakeOutcome::accept()
     }
 }
 
-/// Keeps `ep` on the lab's relays until it closes; spawn it beside `ep`.
-/// Joins n0's relay, with a warning, only once none of the lab's has
-/// answered for 10 s; leaves it once one does, or after 10 min to try the
-/// lab's alone (a 10 s gap while they stay down).
+/// Keeps `ep` on the lab's relays; spawn it beside `ep`. Joins n0's relay,
+/// with a warning, only once none of the lab's has answered for 10 s.
+/// Leaves it once iroh homes on a lab relay again, which it does only for
+/// one a third faster; else after 10 min, to try the lab's alone (a 10 s gap
+/// while they stay down). It holds a clone of `ep`, so both run until
+/// `ep.close()`: dropping the app's handles ends neither.
 pub async fn fallback(ep: Endpoint) {
     fall_back(ep, FALLBACK.parse().expect("static relay url"), GRACE).await
 }
@@ -113,13 +137,13 @@ pub fn transport() -> QuicTransportConfig {
 }
 
 /// The lab's relays (see [`fallback`]), no third-party lookup, no
-/// captive-portal probes; warns of each connection through n0's relays.
+/// captive-portal probes; warns of each path through a relay not the lab's.
 pub fn endpoint() -> Builder {
     let b = Endpoint::builder(presets::Empty)
         .crypto_provider(tls())
         .transport_config(transport())
         .relay_mode(RelayMode::custom(relays()))
-        .hooks(N0);
+        .hooks(Foreign);
     #[cfg(not(target_arch = "wasm32"))]
     let b = {
         let mut probes = iroh::endpoint::NetReportConfig::default();
@@ -140,7 +164,8 @@ mod tests {
     fn handshakes_are_post_quantum() {
         assert_eq!(tls().kx_groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
         assert_eq!(relays().len(), RELAYS.len());
-        assert!(n0(&FALLBACK.parse().unwrap()) && !relays().iter().any(n0));
+        assert!(relays().iter().all(lab) && lab(&"https://iroh.cxn.center/".parse().unwrap()));
+        assert!(!lab(&FALLBACK.parse().unwrap()));
     }
 
     /// The fallback joins only after the lab's relays fail for its grace.
@@ -206,7 +231,8 @@ mod tests {
                 let (i, mut tx, mut rx) = psk::accept(&c, &[&[7; 32], &[8; 32]]).await?;
                 assert_eq!(i, 1);
                 tx.send(&rx.recv(64).await?).await?;
-                rx.end().await?;
+                anyhow::ensure!(rx.next(0).await?.is_none());
+                drop(rx); // read to its sealed end: not a stop
                 tx.finish().await
             });
             let c = a.connect(at, ALPN).await.unwrap();

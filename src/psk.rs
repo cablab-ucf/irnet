@@ -19,13 +19,18 @@ type Pk = <XWing as Kem>::PublicKey;
 type Sk = <XWing as Kem>::PrivateKey;
 type Enc = <XWing as Kem>::EncappedKey;
 
+/// The sending half. Not cancel-safe: a `send` dropped mid-frame (a losing
+/// `select!` branch) breaks the stream, which the peer then fails; time out
+/// a whole exchange instead.
 pub struct Tx(SendStream, AeadCtxS<A, K, XWing>);
+/// The receiving half. Not cancel-safe, as [`Tx`]. Read it to `None` or
+/// [`Rx::end`]: dropped sooner, it tells the peer's [`Tx::finish`] it stopped.
 pub struct Rx(RecvStream, AeadCtxR<A, K, XWing>);
 
 const HELLO: &[u8] = b"irnet psk 2";
 /// The sealed end's associated data, which no other frame carries.
 const END: &[u8] = b"end";
-/// The longest a handshake waits on one message.
+/// The longest a handshake may take, however the peer stalls it.
 const WAIT: Duration = Duration::from_secs(10);
 
 async fn frame(r: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
@@ -36,11 +41,6 @@ async fn frame(r: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
     let mut b = vec![0; n];
     r.read_exact(&mut b).await?;
     Ok(b)
-}
-
-/// A handshake frame: a peer that stalls is dropped, not waited on.
-async fn hs(r: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
-    timeout(WAIT, frame(r, max)).await.context("peer stalled")?
 }
 
 async fn put(s: &mut SendStream, b: &[u8]) -> Result<()> {
@@ -79,31 +79,44 @@ async fn start(
     }
     let (sk, pk) = XWing::gen_keypair();
     put(&mut s, &pk.to_bytes()).await?;
-    let theirs = Pk::from_bytes(&hs(&mut r, 1216).await?).ok().context("bad key")?;
+    let theirs = Pk::from_bytes(&frame(&mut r, 1216).await?).ok().context("bad key")?;
     Ok((s, r, sk, theirs, tls))
 }
 
 async fn enc(r: &mut RecvStream) -> Result<Enc> {
-    Enc::from_bytes(&hs(r, 1120).await?).ok().context("bad key")
+    Enc::from_bytes(&frame(r, 1120).await?).ok().context("bad key")
 }
 
 /// The dialer's end of the channel for `psk`, once the acceptor proves it.
+/// Opens a bi stream, which [`accept`] takes as the next: open none before.
 pub async fn dial(c: &Connection, psk: &[u8; 32]) -> Result<(Tx, Rx)> {
+    timeout(WAIT, dialer(c, psk)).await.context("peer stalled")?
+}
+
+async fn dialer(c: &Connection, psk: &[u8; 32]) -> Result<(Tx, Rx)> {
     let (mut s, mut r, sk, pk, [mine, theirs]) = start(c, true).await?;
     let (e, tx) = sender(psk, &pk, &mine)?;
     put(&mut s, &e.to_bytes()).await?;
     let mut tx = Tx(s, tx);
     tx.send(HELLO).await?;
     let mut rx = receiver(psk, &sk, &enc(&mut r).await?, &theirs).context("bad key")?;
-    ensure!(proves(&mut rx, &hs(&mut r, HELLO.len()).await?), "peer holds not our pre-shared key");
+    ensure!(
+        proves(&mut rx, &frame(&mut r, HELLO.len()).await?),
+        "peer holds not our pre-shared key"
+    );
     Ok((tx, Rx(r, rx)))
 }
 
 /// The acceptor's end, for whichever of `psks` the dialer proves: its index.
+/// Takes the next bi stream the peer opens: accept none before.
 pub async fn accept(c: &Connection, psks: &[&[u8; 32]]) -> Result<(usize, Tx, Rx)> {
+    timeout(WAIT, acceptor(c, psks)).await.context("peer stalled")?
+}
+
+async fn acceptor(c: &Connection, psks: &[&[u8; 32]]) -> Result<(usize, Tx, Rx)> {
     let (mut s, mut r, sk, pk, [mine, theirs]) = start(c, false).await?;
     let e = enc(&mut r).await?;
-    let hello = hs(&mut r, HELLO.len()).await?;
+    let hello = frame(&mut r, HELLO.len()).await?;
     let (i, rx) = (psks.iter().enumerate())
         .find_map(|(i, p)| {
             let mut rx = receiver(p, &sk, &e, &theirs)?;
@@ -139,13 +152,15 @@ impl Tx {
 }
 
 impl Rx {
-    /// The next frame, at most `max` bytes, or `None` at the peer's sealed end.
+    /// The next frame, at most `max` bytes, or `None` at the peer's sealed end
+    /// (and the stream's, so dropping `Rx` then stops nothing).
     pub async fn next(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
         let b = frame(&mut self.0, max).await?;
         if let Ok(m) = self.1.open(&b, b"") {
             return Ok(Some(m));
         }
         self.1.open(&b, END).ok().context("frame fails its pre-shared key")?;
+        self.0.read_to_end(0).await?;
         Ok(None)
     }
 
@@ -157,7 +172,6 @@ impl Rx {
     /// Read to the peer's sealed end: a stream cut short is an error.
     pub async fn end(mut self) -> Result<()> {
         ensure!(self.next(0).await?.is_none(), "frame past the end");
-        self.0.read_to_end(0).await?;
         Ok(())
     }
 }

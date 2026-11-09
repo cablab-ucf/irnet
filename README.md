@@ -10,11 +10,13 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept
 
 - `tls()`: X25519MLKEM768 first (aws-lc-rs; `pure`: ring + RustCrypto ML-KEM
   for wasm, tested against aws-lc).
-- `endpoint()`: the lab's relays only; no n0 DNS, pkarr, UPnP or
-  captive-portal probes: a peer is reached only by the address you give it.
-  BBRv3, 2 MiB stream windows. Warns of any connection through n0's relays.
+- `endpoint()`: homes on the lab's relays only; no n0 DNS, pkarr, UPnP or
+  captive-portal probes: a peer is reached only by the address you give it,
+  through any relay that address names. BBRv3, 2 MiB stream windows. Warns
+  of each path, at the handshake or after, through a relay not the lab's.
 - `fallback`: joins n0's relay, with a warning, only once no lab relay has
-  answered for 10 s; leaves it once one does, or every 10 min to retry.
+  answered for 10 s; leaves it once a lab relay is home again (iroh moves
+  only to one a third faster), else after 10 min.
 - `psk`: a channel for holders of a 32-byte pre-shared key inside the
   connection: HPKE (RFC 9180) PSK mode over X-Wing, fresh keys per side, a
   key per direction, bound to the TLS session; each side proves the key and
