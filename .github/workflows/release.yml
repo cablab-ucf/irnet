@@ -1,0 +1,37 @@
+# By hand only (minutes are scarce): a run naming tag vX.Y.Z tests the
+# commit, then tags it and publishes a release of the source. The tests
+# hold a read-only token; the job that writes runs no build code.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "vX.Y.Z (as in Cargo.toml)"
+        required: true
+permissions: { contents: read }
+env:
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with: { toolchain: stable }
+      - name: The tag is the version
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          grep -qx "version = \"${TAG#v}\"" Cargo.toml
+      - run: cargo test --locked
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - run: gh release create "$TAG" --target "$GITHUB_SHA" --title "irnet $TAG" --generate-notes
