@@ -21,17 +21,21 @@ type Enc = <XWing as Kem>::EncappedKey;
 
 /// The sending half. Not cancel-safe: a `send` dropped mid-frame (a losing
 /// `select!` branch) breaks the stream, which the peer then fails; time out
-/// a whole exchange instead.
+/// a whole exchange instead. A write the peer takes none of for 10 s fails.
 pub struct Tx(SendStream, AeadCtxS<A, K, XWing>);
 /// The receiving half. Not cancel-safe, as [`Tx`]. Read it to `None` or
 /// [`Rx::end`]: dropped sooner, it tells the peer's [`Tx::finish`] it stopped.
+/// It waits out a silent peer, which may be an idle one: time out a reply.
 pub struct Rx(RecvStream, AeadCtxR<A, K, XWing>);
 
 const HELLO: &[u8] = b"irnet psk 2";
 /// The sealed end's associated data, which no other frame carries.
 const END: &[u8] = b"end";
-/// The longest a handshake may take, however the peer stalls it.
-const WAIT: Duration = Duration::from_secs(10);
+/// The longest a handshake may take, a write may make no progress, or the
+/// stream's end may trail its sealed end, however the peer stalls them.
+const WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
+/// The longest [`Tx::finish`] waits for the peer's acks of what is sent.
+const DRAIN: Duration = Duration::from_secs(60);
 
 async fn frame(r: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
     let mut n = [0; 4];
@@ -44,8 +48,13 @@ async fn frame(r: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
 }
 
 async fn put(s: &mut SendStream, b: &[u8]) -> Result<()> {
-    s.write_all(&u32::try_from(b.len())?.to_be_bytes()).await?;
-    Ok(s.write_all(b).await?)
+    let n = u32::try_from(b.len())?.to_be_bytes();
+    for mut b in [&n[..], b] {
+        while !b.is_empty() {
+            b = &b[timeout(WAIT, s.write(b)).await.context("peer stalled")??..];
+        }
+    }
+    Ok(())
 }
 
 fn mode(psk: &[u8; 32]) -> PskBundle<'_> {
@@ -108,7 +117,9 @@ async fn dialer(c: &Connection, psk: &[u8; 32]) -> Result<(Tx, Rx)> {
 }
 
 /// The acceptor's end, for whichever of `psks` the dialer proves: its index.
-/// Takes the next bi stream the peer opens: accept none before.
+/// Takes the next bi stream the peer opens: accept none before. Costs an
+/// X-Wing decapsulation per key tried, before the peer proves any: keep
+/// `psks` short.
 pub async fn accept(c: &Connection, psks: &[&[u8; 32]]) -> Result<(usize, Tx, Rx)> {
     timeout(WAIT, acceptor(c, psks)).await.context("peer stalled")?
 }
@@ -141,12 +152,13 @@ impl Tx {
     }
 
     /// Seal the end and finish the stream; waits for the peer's acks or the
-    /// connection's close. `Ok` is not delivery (only the peer's reply is),
-    /// but a peer that stops reading is an error.
+    /// connection's close, 60 s at most. `Ok` is not delivery (only the
+    /// peer's reply is), but a peer that stops reading is an error.
     pub async fn finish(mut self) -> Result<()> {
         self.seal(b"", END).await?;
         self.0.finish()?;
-        ensure!(!matches!(self.0.stopped().await, Ok(Some(_))), "peer stopped reading");
+        let stopped = timeout(DRAIN, self.0.stopped()).await.context("peer stalled")?;
+        ensure!(!matches!(stopped, Ok(Some(_))), "peer stopped reading");
         Ok(())
     }
 }
@@ -160,7 +172,7 @@ impl Rx {
             return Ok(Some(m));
         }
         self.1.open(&b, END).ok().context("frame fails its pre-shared key")?;
-        self.0.read_to_end(0).await?;
+        timeout(WAIT, self.0.read_to_end(0)).await.context("peer stalled")??;
         Ok(None)
     }
 
