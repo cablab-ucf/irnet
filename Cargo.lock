@@ -1257,9 +1257,11 @@ dependencies = [
  "hpke",
  "iroh",
  "ml-kem",
+ "n0-future",
  "noq-proto",
  "rustls",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

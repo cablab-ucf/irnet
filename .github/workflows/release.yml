@@ -25,6 +25,7 @@ jobs:
           [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           grep -qx "version = \"${TAG#v}\"" Cargo.toml
       - run: cargo test --locked
+      - run: cargo test --locked --no-default-features --features pure
 
   release:
     needs: test
