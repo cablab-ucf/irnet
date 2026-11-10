@@ -29,5 +29,6 @@ aws-lc = ["iroh/tls-aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"
 pure = ["iroh/tls-ring", "rustls/ring", "dep:ml-kem"]
 
 [dev-dependencies]
+iroh-relay = { version = "1.4", default-features = false, features = ["server", "tls-aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -10,10 +10,10 @@ pub mod pq;
 pub mod psk;
 
 use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, Builder, Connection, Endpoint};
-use iroh::endpoint::{EndpointHooks, PathEvent, QuicTransportConfig, presets};
+use iroh::endpoint::{EndpointHooks, PathEvent, QuicTransportConfig, RelayStatus, presets};
 use iroh::{EndpointAddr, EndpointId, RelayMode, RelayUrl, TransportAddr, Watcher};
-use n0_future::StreamExt;
-use n0_future::time::{Duration, Instant, timeout};
+use n0_future::time::{Duration, Instant, sleep, timeout};
+use n0_future::{FutureExt, StreamExt};
 use noq_proto::crypto::rustls::HandshakeData;
 use rustls::NamedGroup;
 use rustls::crypto::CryptoProvider;
@@ -27,7 +27,7 @@ pub const RELAYS: [&str; 1] = ["https://iroh.cxn.center./"];
 pub const FALLBACK: &str = "https://use1-1.relay.n0.iroh.link./";
 
 /// How long the lab's relays may all fail before [`fallback`] joins n0's,
-/// and how long it stays there before trying the lab's alone again.
+/// and how long it stays there if it cannot probe the lab's.
 const GRACE: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(600);
 
@@ -92,43 +92,55 @@ impl EndpointHooks for Foreign {
 }
 
 /// Keeps `ep` on the lab's relays; spawn it beside `ep`. Joins n0's relay,
-/// with a warning, only once none of the lab's has answered for 10 s.
-/// Leaves it once iroh homes on a lab relay again, which it does only for
-/// one a third faster; else after 10 min, to try the lab's alone (a 10 s gap
-/// while they stay down). It holds a clone of `ep`, so both run until
-/// `ep.close()`: dropping the app's handles ends neither.
+/// with a warning, only once none of the lab's has answered for 10 s, and
+/// leaves it as soon as one answers again: while `ep` is on n0's, a second
+/// endpoint on the lab's alone tells when (`ep` itself would stay home on
+/// n0's unless a lab relay were a third faster). It holds a clone of `ep`,
+/// so both run until `ep.close()`: dropping the app's handles ends neither.
 pub async fn fallback(ep: Endpoint) {
-    fall_back(ep, FALLBACK.parse().expect("static relay url"), GRACE).await
+    fall_back(ep, endpoint, FALLBACK.parse().expect("static relay url"), GRACE).await
 }
 
-async fn fall_back(ep: Endpoint, url: RelayUrl, grace: Duration) {
+async fn fall_back(ep: Endpoint, probe: fn() -> Builder, url: RelayUrl, grace: Duration) {
+    let up = |s: Vec<RelayStatus>| s.iter().any(|s| s.is_connected() && *s.url() != url);
     let mut w = ep.home_relay_status();
-    let (mut on, mut until) = (false, Instant::now() + grace);
     ep.closed()
         .run_until(async {
             loop {
-                if w.get().iter().any(|s| s.is_connected() && *s.url() != url) {
-                    if on && ep.remove_relay(&url).await.is_some() {
-                        info!("a lab relay answers: left {url}");
+                // On the lab's, until none has answered for `grace`.
+                let mut until = Instant::now() + grace;
+                loop {
+                    if up(w.get()) {
+                        if w.updated().await.is_err() {
+                            return;
+                        }
+                        until = Instant::now() + grace;
+                    } else {
+                        let left = until.saturating_duration_since(Instant::now());
+                        match timeout(left, w.updated()).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(_)) => return,
+                            Err(_) => break,
+                        }
                     }
-                    on = false;
-                    if w.updated().await.is_err() {
-                        return;
+                }
+                warn!("no lab relay answered for {grace:?}: relaying through {url}");
+                ep.insert_relay(url.clone(), Arc::new(url.clone().into())).await;
+                // On n0's, until a lab relay answers `ep` or the probe.
+                match probe().bind().await {
+                    Ok(probe) => {
+                        let mut p = probe.home_relay_status();
+                        while !up(w.get())
+                            && !up(p.get())
+                            && w.updated().or(p.updated()).await.is_ok()
+                        {}
+                        probe.close().await;
                     }
-                    until = Instant::now() + grace;
-                } else if let Ok(r) =
-                    timeout(until.saturating_duration_since(Instant::now()), w.updated()).await
-                {
-                    if r.is_err() {
-                        return;
-                    }
-                } else if on {
-                    ep.remove_relay(&url).await;
-                    (on, until) = (false, Instant::now() + grace);
-                } else {
-                    warn!("no lab relay answered for {grace:?}: relaying through {url}");
-                    ep.insert_relay(url.clone(), Arc::new(url.clone().into())).await;
-                    (on, until) = (true, Instant::now() + RETRY);
+                    // No probe: leave n0's blind, to try the lab's alone.
+                    Err(_) => sleep(RETRY).await,
+                }
+                if ep.remove_relay(&url).await.is_some() {
+                    info!("trying the lab's relays alone: left {url}");
                 }
             }
         })
@@ -199,11 +211,49 @@ mod tests {
         let lab: RelayUrl = "https://lab.invalid./".parse().unwrap();
         let ep = endpoint().relay_mode(RelayMode::custom([lab])).bind().await.unwrap();
         let url: RelayUrl = "https://fallback.invalid./".parse().unwrap();
-        tokio::spawn(fall_back(ep.clone(), url.clone(), Duration::from_millis(300)));
+        tokio::spawn(fall_back(ep.clone(), endpoint, url.clone(), Duration::from_millis(300)));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(ep.remove_relay(&url).await.is_none());
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(ep.remove_relay(&url).await.is_some());
+        ep.close().await;
+    }
+
+    /// The fallback leaves as soon as a lab relay answers again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leaves_the_fallback_when_the_lab_returns() {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let serve = |at: std::net::SocketAddr| async move {
+            let mut cfg = ServerConfig::default();
+            cfg.relay = Some(RelayConfig::new(at));
+            Server::spawn(cfg).await.unwrap()
+        };
+        // A lab relay that is down, to come back at the same address.
+        let s = serve(([127, 0, 0, 1], 0).into()).await;
+        let at = s.http_addr().unwrap();
+        s.shutdown().await.unwrap();
+        // No proxy from the environment: the lab relay here is on localhost.
+        static LAB: std::sync::OnceLock<RelayUrl> = std::sync::OnceLock::new();
+        LAB.set(format!("http://{at}/").parse().unwrap()).unwrap();
+        fn lab() -> Builder {
+            let lab = RelayMode::custom([LAB.get().unwrap().clone()]);
+            Endpoint::builder(presets::Empty).crypto_provider(tls()).relay_mode(lab)
+        }
+        let url: RelayUrl = "https://fallback.invalid./".parse().unwrap();
+        let ep = lab().bind().await.unwrap();
+        tokio::spawn(fall_back(ep.clone(), lab, url.clone(), Duration::from_millis(300)));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(ep.insert_relay(url.clone(), Arc::new(url.clone().into())).await.is_some());
+        let _s = serve(at).await;
+        let mut w = ep.home_relay_status();
+        let home = async {
+            while !w.get().iter().any(|s| s.is_connected()) {
+                w.updated().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), home).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(ep.remove_relay(&url).await.is_none());
         ep.close().await;
     }
 
