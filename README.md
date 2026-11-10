@@ -17,8 +17,8 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept
   of each relay not the lab's: one an address names, before it is dialed,
   and one a path crosses, at the handshake or after.
 - `fallback`: joins n0's relay, with a warning, only once no lab relay has
-  answered for 10 s; leaves it once a lab relay is home again (iroh moves
-  only to one a third faster), else after 10 min.
+  answered for 10 s; leaves it as soon as one answers again, which a second
+  endpoint on the lab's relays alone watches for meanwhile.
 - `psk`: a channel for holders of a 32-byte pre-shared key inside the
   connection: HPKE (RFC 9180) PSK mode over X-Wing, fresh keys per side, a
   key per direction, bound to the TLS session; each side proves the key and
