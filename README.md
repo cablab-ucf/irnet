@@ -35,8 +35,10 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept:
   alone: its home relay (no IPs) published to n0's DNS, peers looked up
   there, a classical handshake accepted with a warning. Lab peers still
   meet on X25519MLKEM768 and the lab's relays.
-  n0 then sees this machine's IP with its id, and each id it asks for:
-  not for an app whose peers must stay unknown to others.
+  n0 then sees this machine's IP with its id every 5 minutes (the record
+  is republished), and the id of every peer dialed before a path to it
+  exists, lab peers included: not for an app whose peers must stay unknown
+  to others.
 - `fallback`: joins n0's relay, with a warning, only once no lab relay has
   answered for 10 s; leaves it as soon as one answers again, which a second
   endpoint on the lab's relays alone watches for meanwhile.
