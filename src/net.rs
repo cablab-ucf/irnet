@@ -51,9 +51,10 @@ fn kx(c: &Connection) -> Option<NamedGroup> {
 /// Warns of each relay not the lab's (n0's included): those a dialed address
 /// names, before any is contacted; those a connection's paths cross at its
 /// handshake, and any it opens until it closes. Refuses a handshake that is
-/// not post-quantum: a peer without X25519MLKEM768.
+/// not post-quantum (a peer without X25519MLKEM768), or warns of it if `.0`
+/// ([`interop`]).
 #[derive(Debug)]
-struct Foreign;
+struct Foreign(bool);
 
 impl EndpointHooks for Foreign {
     async fn before_connect(&self, to: &EndpointAddr, _: &[u8]) -> BeforeConnectOutcome {
@@ -66,7 +67,9 @@ impl EndpointHooks for Foreign {
     async fn after_handshake(&self, c: &Connection) -> AfterHandshakeOutcome {
         let (peer, mut opened) = (c.remote_id(), c.path_events());
         let kx = kx(c);
-        if kx != Some(NamedGroup::X25519MLKEM768) {
+        if kx != Some(NamedGroup::X25519MLKEM768) && self.0 {
+            warn!(%peer, ?kx, "handshake not post-quantum: accepted (interop)");
+        } else if kx != Some(NamedGroup::X25519MLKEM768) {
             warn!(%peer, ?kx, "handshake not post-quantum: refused");
             return AfterHandshakeOutcome::Reject {
                 error_code: 0u32.into(),
@@ -189,6 +192,26 @@ pub fn endpoint() -> Builder {
 /// lab's): a deployment's own. Relays on this machine are met without the
 /// environment's proxy.
 pub fn on(relays: &[RelayUrl]) -> Builder {
+    build(relays, false)
+}
+
+/// [`endpoint`], reachable by and able to reach any iroh peer by its id
+/// alone: publishes its home relay (not its IPs) to n0's DNS and looks up
+/// peers there, and accepts a classical handshake with a warning. Lab peers
+/// still get X25519MLKEM768 and the lab's relays first; spawn [`fallback`]
+/// too to reach peers homed on n0's relays when the lab's are down.
+pub fn interop() -> Builder {
+    use iroh::address_lookup::{PkarrPublisher, PkarrResolver};
+    warn!("interop: ids published to and looked up at n0's DNS; classical peers accepted");
+    let b = build(&[], true)
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(PkarrResolver::n0_dns());
+    #[cfg(not(target_arch = "wasm32"))]
+    let b = b.address_lookup(iroh::address_lookup::DnsAddressLookup::n0_dns());
+    b
+}
+
+fn build(relays: &[RelayUrl], interop: bool) -> Builder {
     let relays = if relays.is_empty() { self::relays() } else { relays.to_vec() };
     let local = |r: &RelayUrl| {
         let h = r.host_str().unwrap_or_default();
@@ -199,7 +222,7 @@ pub fn on(relays: &[RelayUrl]) -> Builder {
         .crypto_provider(tls())
         .transport_config(transport())
         .relay_mode(RelayMode::custom(relays))
-        .hooks(Foreign);
+        .hooks(Foreign(interop));
     #[cfg(not(target_arch = "wasm32"))]
     let b = {
         let mut probes = iroh::endpoint::NetReportConfig::default();
@@ -443,6 +466,39 @@ mod tests {
             let got = tokio::time::timeout(Duration::from_secs(5), srv).await;
             let pq = from.id() != old.id() && to.id() != old.id();
             assert_eq!(got.ok().and_then(|g| g.unwrap()), pq.then(|| b"pq".to_vec()));
+        }
+    }
+
+    /// [`interop`] takes a classical peer, either way, and a lab peer still
+    /// gets X25519MLKEM768.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_accepts_a_classical_handshake() {
+        use rustls::crypto::aws_lc_rs::{default_provider, kx_group::X25519};
+        const ALPN: &[u8] = b"irnet/test";
+        let open = || interop().alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind();
+        let classical = CryptoProvider { kx_groups: vec![X25519], ..default_provider() };
+        let old = Endpoint::builder(presets::Empty)
+            .crypto_provider(Arc::new(classical))
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind();
+        let (a, b, old) = (open().await.unwrap(), open().await.unwrap(), old.await.unwrap());
+        for (from, to, want) in
+            [(&old, &b, None), (&a, &old, None), (&a, &b, Some(NamedGroup::X25519MLKEM768))]
+        {
+            let (to2, at) = (to.clone(), to.addr());
+            let srv = tokio::spawn(async move {
+                let c = to2.accept().await?.await.ok()?;
+                c.accept_uni().await.ok()?.read_to_end(8).await.ok()
+            });
+            let c = from.connect(at, ALPN).await.unwrap();
+            assert!(want.is_none() || kx(&c) == want);
+            let mut tx = c.open_uni().await.unwrap();
+            tx.write_all(b"ok").await.unwrap();
+            tx.finish().unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(5), srv).await.unwrap().unwrap();
+            assert_eq!(got, Some(b"ok".to_vec()));
+            c.close(0u32.into(), b"");
         }
     }
 
