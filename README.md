@@ -9,6 +9,12 @@ irnet::psk::prove(&conn, &psk).await?;                        // or psk::admit: 
 let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept: a sealed channel
 ```
 
+- Features: `endpoint` (default) is the iroh endpoint and `psk`; without it
+  irnet is `tls` and `pq` alone, twelve crates and no iroh, for a crate that
+  meets a relay itself (pushir). So every crate takes its post-quantum TLS
+  from here.
+- `pq()`: X25519MLKEM768 and nothing else, for a hop that must not fall
+  back. `on(relays)`: `endpoint()` on a deployment's own relays.
 - `tls()`: X25519MLKEM768 first (aws-lc-rs; `pure`: ring + RustCrypto ML-KEM
   for wasm, tested against aws-lc). A peer without it is refused. A relay
   without it gets X25519: what crosses it is sealed end to end already, but
