@@ -1,4 +1,4 @@
-//! One iroh endpoint for every cab-ucf app.
+//! One iroh endpoint for every cablab-ucf app.
 
 #![forbid(unsafe_code)]
 
@@ -59,8 +59,8 @@ fn kx(c: &Connection) -> Option<NamedGroup> {
 
 /// Warns of each relay not the lab's (n0's included): those a dialed address
 /// names, before any is contacted; those a connection's paths cross at its
-/// handshake, and any it opens until it closes. Warns too of a handshake
-/// that is not post-quantum: a peer without X25519MLKEM768.
+/// handshake, and any it opens until it closes. Refuses a handshake that is
+/// not post-quantum: a peer without X25519MLKEM768.
 #[derive(Debug)]
 struct Foreign;
 
@@ -76,7 +76,11 @@ impl EndpointHooks for Foreign {
         let (peer, mut opened) = (c.remote_id(), c.path_events());
         let kx = kx(c);
         if kx != Some(NamedGroup::X25519MLKEM768) {
-            warn!(%peer, ?kx, "handshake not post-quantum");
+            warn!(%peer, ?kx, "handshake not post-quantum: refused");
+            return AfterHandshakeOutcome::Reject {
+                error_code: 0u32.into(),
+                reason: b"handshake not post-quantum".to_vec(),
+            };
         }
         c.paths().iter().for_each(|p| foreign(peer, p.remote_addr()));
         // The event stream holds no handle, so the connection still closes on drop.
@@ -147,7 +151,9 @@ async fn fall_back(ep: Endpoint, probe: fn() -> Builder, url: RelayUrl, grace: D
         .await;
 }
 
-/// X25519MLKEM768 first, X25519 for peers without it.
+/// X25519MLKEM768 first. X25519 stays on offer for relays without it (their
+/// hop carries only what is already sealed end to end); a peer's handshake
+/// without it is refused.
 pub fn tls() -> Arc<CryptoProvider> {
     #[cfg(feature = "aws-lc")]
     let p = rustls::crypto::aws_lc_rs::default_provider();
@@ -156,13 +162,29 @@ pub fn tls() -> Arc<CryptoProvider> {
     Arc::new(p)
 }
 
-/// 2 MiB stream windows (16 MB/s at 130 ms), BBRv3 for lossy paths (noq
-/// calls it experimental; its other controllers, Cubic and NewReno, take
-/// loss for congestion).
+/// What one stream may hold in flight: noq drops a connection whose stream
+/// buffers over 1024 gaps, which 2 MiB of full packets cannot reach however
+/// they are lost. A stream so carries 2 MiB per round trip (160 Mbit/s at
+/// 100 ms): spread a large transfer over many.
+const STREAM: u32 = 2 << 20;
+
+/// What a connection may hold in flight each way once its peer is known
+/// ([`wide`]), over all its streams: 64 MiB per round trip is 5 Gbit/s at
+/// 100 ms and 50 Gbit/s at 10 ms, more than the one core a connection has
+/// seals. Past that, open several connections.
+pub const WINDOW: u32 = 64 << 20;
+
+/// What a stranger may make us hold: [`wide`] lifts it to [`WINDOW`].
+const NARROW: u32 = 8 << 20;
+
+/// [`WINDOW`] to send, [`NARROW`] to receive until [`wide`]; BBRv3 for lossy
+/// paths (noq calls it experimental; its other controllers, Cubic and
+/// NewReno, take loss for congestion).
 pub fn transport() -> QuicTransportConfig {
     let q = QuicTransportConfig::builder()
-        .stream_receive_window((2u32 << 20).into())
-        .receive_window((8u32 << 20).into())
+        .stream_receive_window(STREAM.into())
+        .receive_window(NARROW.into())
+        .send_window(WINDOW.into())
         .congestion_controller_factory(Arc::new(noq_proto::congestion::Bbr3Config::default()));
     // iroh #4647
     #[cfg(target_os = "android")]
@@ -170,9 +192,15 @@ pub fn transport() -> QuicTransportConfig {
     q.build()
 }
 
+/// Lets `c`'s peer fill [`WINDOW`], not the 8 MiB a stranger gets: for a
+/// peer the app knows ([`psk::prove`] and [`psk::admit`] do it themselves).
+pub fn wide(c: &Connection) {
+    c.set_receive_window(WINDOW.into());
+}
+
 /// The lab's relays (see [`fallback`]), no third-party lookup, no
 /// captive-portal probes; warns of each relay not the lab's, dialed or on a
-/// path, and of each handshake not post-quantum.
+/// path, and refuses each handshake not post-quantum.
 pub fn endpoint() -> Builder {
     let b = Endpoint::builder(presets::Empty)
         .crypto_provider(tls())
@@ -378,6 +406,159 @@ mod tests {
             anyhow::Ok(())
         };
         assert!(format!("{:#}", sent.await.unwrap_err()).contains("stalled"));
+        c.close(0u32.into(), b"");
+        srv.await.unwrap();
+    }
+
+    /// A peer whose handshake is not post-quantum is refused, whoever dials.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refuses_a_classical_handshake() {
+        use rustls::crypto::aws_lc_rs::{default_provider, kx_group::X25519};
+        const ALPN: &[u8] = b"irnet/test";
+        let ours = || endpoint().alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind();
+        let classical = CryptoProvider { kx_groups: vec![X25519], ..default_provider() };
+        let old = Endpoint::builder(presets::Empty)
+            .crypto_provider(Arc::new(classical))
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind();
+        let (a, b, old) = (ours().await.unwrap(), ours().await.unwrap(), old.await.unwrap());
+        for (from, to) in [(&old, &b), (&a, &old), (&a, &b)] {
+            let (to2, at) = (to.clone(), to.addr());
+            let srv = tokio::spawn(async move {
+                let c = to2.accept().await?.await.ok()?;
+                let mut rx = c.accept_uni().await.ok()?;
+                rx.read_to_end(8).await.ok()
+            });
+            let sent = async {
+                let c = from.connect(at, ALPN).await.ok()?;
+                let mut tx = c.open_uni().await.ok()?;
+                tx.write_all(b"pq").await.ok()?;
+                tx.finish().ok()?;
+                c.closed().await;
+                Some(())
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(5), sent).await;
+            let got = tokio::time::timeout(Duration::from_secs(5), srv).await;
+            let pq = from.id() != old.id() && to.id() != old.id();
+            assert_eq!(got.ok().and_then(|g| g.unwrap()), pq.then(|| b"pq".to_vec()));
+        }
+    }
+
+    /// A proved key opens the connection itself: raw streams, and the wide
+    /// window a stranger does not get. Another key, or an echo, proves nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn psk_proof_opens_the_connection() {
+        const ALPN: &[u8] = b"irnet/psk";
+        let bind = || endpoint().alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind();
+        let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+        // Whether 24 MiB fit streams nobody reads: past a stranger's 8 MiB.
+        let fits = async |c: &Connection| {
+            let all = async {
+                for _ in 0..16 {
+                    let mut tx = c.open_uni().await.unwrap();
+                    tx.write_all(&[0; 3 << 19]).await.unwrap();
+                    std::mem::forget(tx);
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(3), all).await.is_ok()
+        };
+        for (mine, admitted) in [(Some([8; 32]), true), (Some([9; 32]), false), (None, false)] {
+            let (b2, at) = (b.clone(), b.addr());
+            let srv = tokio::spawn(async move {
+                let c = b2.accept().await.unwrap().await.unwrap();
+                let i = match mine {
+                    Some(_) => psk::admit(&c, &[&[7; 32], &[8; 32]]).await.ok(),
+                    None => None,
+                };
+                let mut held = vec![];
+                while let Ok(rx) = c.accept_uni().await {
+                    held.push(rx);
+                }
+                i
+            });
+            let c = a.connect(at, ALPN).await.unwrap();
+            let proved = match mine {
+                Some(k) => psk::prove(&c, &k).await.is_ok(),
+                None => false,
+            };
+            assert_eq!(proved, admitted);
+            assert_eq!(fits(&c).await, admitted);
+            c.close(0u32.into(), b"");
+            assert_eq!(srv.await.unwrap(), admitted.then_some(1));
+        }
+        // An echo of the dialer's own proof is not the acceptor's.
+        let (b2, at) = (b.clone(), b.addr());
+        let srv = tokio::spawn(async move {
+            let c = b2.accept().await.unwrap().await.unwrap();
+            let (mut tx, mut rx) = c.accept_bi().await.unwrap();
+            tx.write_all(&rx.read_to_end(64).await.unwrap()).await.unwrap();
+            tx.finish().unwrap();
+            c.closed().await;
+        });
+        let c = a.connect(at, ALPN).await.unwrap();
+        assert!(psk::prove(&c, &[8; 32]).await.is_err());
+        c.close(0u32.into(), b"");
+        srv.await.unwrap();
+    }
+
+    /// How fast this machine moves bytes over loopback, raw over 32 streams
+    /// after a proof and through the sealed channel: `cargo test --release
+    /// speed -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn speed() {
+        const ALPN: &[u8] = b"irnet/speed";
+        const STREAMS: usize = 32;
+        const EACH: usize = 128 << 20;
+        const SEALED: usize = 256 << 20;
+        let bind = || endpoint().alpns(vec![ALPN.to_vec()]).relay_mode(RelayMode::Disabled).bind();
+        let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+        let at = b.addr();
+        let srv = tokio::spawn(async move {
+            let c = b.accept().await.unwrap().await.unwrap();
+            psk::admit(&c, &[&[8; 32]]).await.unwrap();
+            let mut all = n0_future::task::JoinSet::new();
+            for _ in 0..STREAMS {
+                let mut rx = c.accept_uni().await.unwrap();
+                all.spawn(async move {
+                    let (mut n, mut buf) = (0, vec![0; 1 << 20]);
+                    while let Some(k) = rx.read(&mut buf).await.unwrap() {
+                        n += k;
+                    }
+                    assert_eq!(n, EACH);
+                });
+            }
+            all.join_all().await;
+            let (_, _tx, mut rx) = psk::accept(&c, &[&[8; 32]]).await.unwrap();
+            while rx.next(1 << 20).await.unwrap().is_some() {}
+            c.closed().await;
+        });
+        let c = a.connect(at, ALPN).await.unwrap();
+        psk::prove(&c, &[8; 32]).await.unwrap();
+        let rate = |n: usize, t: std::time::Instant| n as f64 * 8e-9 / t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let mut all = n0_future::task::JoinSet::new();
+        for _ in 0..STREAMS {
+            let mut tx = c.open_uni().await.unwrap();
+            all.spawn(async move {
+                let buf = vec![0; 1 << 20];
+                for _ in 0..EACH >> 20 {
+                    tx.write_all(&buf).await.unwrap();
+                }
+                tx.finish().unwrap();
+                tx.stopped().await.unwrap();
+            });
+        }
+        all.join_all().await;
+        println!("{STREAMS} raw streams: {:.2} Gbit/s", rate(STREAMS * EACH, t));
+        let (t, buf) = (std::time::Instant::now(), vec![0; 1 << 20]);
+        let (mut tx, _rx) = psk::dial(&c, &[8; 32]).await.unwrap();
+        for _ in 0..SEALED >> 20 {
+            tx.send(&buf).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        println!("sealed channel: {:.2} Gbit/s", rate(SEALED, t));
         c.close(0u32.into(), b"");
         srv.await.unwrap();
     }

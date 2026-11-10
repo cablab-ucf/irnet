@@ -1447,9 +1447,11 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "irnet"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "chacha20poly1305",
+ "hmac",
  "hpke",
  "iroh",
  "iroh-relay",
@@ -1457,6 +1459,7 @@ dependencies = [
  "n0-future",
  "noq-proto",
  "rustls",
+ "sha2",
  "tokio",
  "tracing",
 ]

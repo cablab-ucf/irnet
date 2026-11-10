@@ -1,10 +1,10 @@
 [package]
 name = "irnet"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
-description = "One post-quantum iroh endpoint for cab-ucf apps: TLS, relays, transport"
+description = "One post-quantum iroh endpoint for cablab-ucf apps: TLS, relays, transport"
 repository = "https://github.com/cablab-ucf/irnet"
 
 [dependencies]
@@ -14,6 +14,9 @@ n0-future = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 anyhow = "1"
 hpke = "0.15"
+hmac = "0.13"
+sha2 = "0.11"
+chacha20poly1305 = "0.11"
 ml-kem = { version = "0.3.4", features = ["getrandom", "zeroize"], optional = true }
 tracing = "0.1"
 
