@@ -1,32 +1,38 @@
 [package]
 name = "irnet"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
-description = "One post-quantum iroh endpoint for cab-ucf apps: TLS, relays, transport"
+description = "One post-quantum iroh endpoint for cablab-ucf apps: TLS, relays, transport"
 repository = "https://github.com/cablab-ucf/irnet"
 
 [dependencies]
-iroh = { version = "1.4", default-features = false }
-noq-proto = { version = "1.4", default-features = false }
-n0-future = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
-anyhow = "1"
-hpke = "0.15"
+iroh = { version = "1.4", default-features = false, optional = true }
+noq-proto = { version = "1.4", default-features = false, optional = true }
+n0-future = { version = "0.3", optional = true }
+anyhow = { version = "1", optional = true }
+hpke = { version = "0.15", optional = true }
+hmac = { version = "0.13", optional = true }
+sha2 = { version = "0.11", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
 ml-kem = { version = "0.3.4", features = ["getrandom", "zeroize"], optional = true }
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 
 # Desktops: the system's roots, as any other https client there.
 [target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dependencies]
-iroh = { version = "1.4", default-features = false, features = ["platform-verifier"] }
+iroh = { version = "1.4", default-features = false, features = ["platform-verifier"], optional = true }
 
 [features]
-default = ["aws-lc"]
+default = ["aws-lc", "endpoint"]
+# The iroh endpoint and the psk channel. Without it: `tls` and `pq` alone,
+# for a crate that speaks to a relay itself (pushir).
+endpoint = ["dep:iroh", "dep:noq-proto", "dep:n0-future", "dep:anyhow", "dep:hpke", "dep:hmac", "dep:sha2", "dep:chacha20poly1305", "dep:tracing"]
 # Native: aws-lc-rs, whose X25519MLKEM768 is the reference.
-aws-lc = ["iroh/tls-aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+aws-lc = ["iroh?/tls-aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 # Browsers (wasm32): ring's X25519 and RustCrypto's ML-KEM, pure Rust.
-pure = ["iroh/tls-ring", "rustls/ring", "dep:ml-kem"]
+pure = ["iroh?/tls-ring", "rustls/ring", "dep:ml-kem"]
 
 [dev-dependencies]
 iroh-relay = { version = "1.4", default-features = false, features = ["server", "tls-aws-lc-rs"] }
