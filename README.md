@@ -19,7 +19,8 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept:
   for wasm, tested against aws-lc). A peer without it is refused. A relay
   without it gets X25519: what crosses it is sealed end to end already, but
   who talks to whom is then hidden from today's computers only.
-- `endpoint()`: homes on the lab's relays only; no n0 DNS, pkarr, UPnP or
+- `endpoint()`: homes on the lab's first relay, irpush.cxn.center (pushir's:
+  X25519MLKEM768, a ping hours apart); no n0 DNS, pkarr, UPnP or
   captive-portal probes: a peer is reached only by the address you give it,
   through any relay that address names. Warns of each relay not the lab's:
   one an address names, before it is dialed, and one a path crosses, at the
@@ -31,9 +32,11 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept:
   transfer goes over many streams, and past one core's worth over several
   connections. `cargo test --release speed -- --ignored --nocapture`
   measures this machine.
-- `fallback`: joins n0's relay, with a warning, only once no lab relay has
-  answered for 10 s; leaves it as soon as one answers again, which a second
-  endpoint on the lab's relays alone watches for meanwhile.
+- `fallback`: the next relay joins, with a warning, only once those before
+  it have not answered for 10 s: iroh.cxn.center (a stock relay, X25519
+  only), then n0's. All but the best leave as soon as a better one answers
+  again, which a second endpoint on the better ones alone watches for
+  meanwhile.
 - `psk::prove`, `psk::admit`: each side shows HMAC-SHA256 of the TLS
   session's exporter under a 32-byte pre-shared key: 64 bytes, no key
   exchange, a hash per key for the acceptor. The connection is then the
