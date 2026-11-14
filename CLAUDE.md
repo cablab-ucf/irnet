@@ -9,3 +9,7 @@
 - The wire stays compatible with chatir v0.4.5 and later: the relay TLS
   (post-quantum handshake, its names and ALPNs) and `RELAYS`. Change it
   only when nothing else works, keeping the old form beside the new.
+- The lab's relays carry every phone's push mailbox too (pushir on
+  irpush.cxn.center, through `irnet::pq`): a change to the relay TLS,
+  names or `fallback` must keep a sleeping phone reachable. Run pushir's
+  `make relay-test` and chatir's core tests before it lands.
