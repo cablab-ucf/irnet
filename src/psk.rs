@@ -118,7 +118,7 @@ async fn dialer(c: &Connection, psk: &[u8; 32], seal: bool) -> Result<Option<(Tx
         s.finish()?;
     }
     let m = frame(&mut r, ENC + TAG).await?;
-    let (enc, tag) = m.split_at_checked(m.len().wrapping_sub(TAG)).context("short proof")?;
+    let (enc, tag) = m.split_last_chunk::<TAG>().context("short proof")?;
     mac(psk, &[V, b" accept", &tls, &pk, enc])
         .verify_slice(tag)
         .ok()

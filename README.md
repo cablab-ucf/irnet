@@ -24,7 +24,8 @@ let (tx, rx) = irnet::psk::dial(&conn, &psk).await?;          // or psk::accept:
   captive-portal probes: a peer is reached only by the address you give it,
   through any relay that address names. Warns of each relay not the lab's:
   one an address names, before it is dialed, and one a path crosses, at the
-  handshake or after.
+  handshake or after. The post-quantum check follows the handshake, so
+  0-RTT (`into_0rtt`) would move data before it: leave it unused.
 - Speed: BBRv3. A stream carries 2 MiB per round trip (noq drops a
   connection whose stream buffers over 1024 gaps; 2 MiB cannot), a
   connection 64 MiB over all its streams once its peer is known (`wide`;

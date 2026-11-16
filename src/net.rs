@@ -8,6 +8,7 @@ use n0_future::time::{Duration, Instant, timeout};
 use n0_future::{FutureExt, StreamExt};
 use noq_proto::crypto::rustls::HandshakeData;
 use rustls::NamedGroup;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -20,10 +21,11 @@ pub const RELAYS: [&str; 2] = ["https://irpush.cxn.center./", "https://iroh.cxn.
 pub const FALLBACK: &str = "https://use1-1.relay.n0.iroh.link./";
 
 /// How long the relays an endpoint has may all fail before [`fallback`]
-/// joins the next, and how long it stays there if it cannot probe the
-/// better ones.
+/// joins the next.
 const GRACE: Duration = Duration::from_secs(10);
+/// How long it stays there if it cannot probe the better ones.
 const RETRY: Duration = Duration::from_secs(600);
+/// How long it waits on relays that change nothing before it looks again.
 const DAY: Duration = Duration::from_secs(86400);
 
 pub fn relays() -> Vec<RelayUrl> {
@@ -68,7 +70,7 @@ impl EndpointHooks for Foreign {
     }
 
     async fn after_handshake(&self, c: &Connection) -> AfterHandshakeOutcome {
-        let (peer, mut opened) = (c.remote_id(), c.path_events());
+        let (peer, mut opened, weak) = (c.remote_id(), c.path_events(), c.weak_handle());
         let kx = kx(c);
         if kx != Some(NamedGroup::X25519MLKEM768) {
             warn!(%peer, ?kx, "handshake not post-quantum: refused");
@@ -77,12 +79,17 @@ impl EndpointHooks for Foreign {
                 reason: b"handshake not post-quantum".to_vec(),
             };
         }
-        c.paths().iter().for_each(|p| foreign(peer, p.remote_addr()));
-        // The event stream holds no handle, so the connection still closes on drop.
+        let open =
+            move |c: &Connection| c.paths().iter().for_each(|p| foreign(peer, p.remote_addr()));
+        open(c);
+        // Neither the events nor `weak` hold the connection: it still closes on drop.
         n0_future::task::spawn(async move {
             while let Some(e) = opened.next().await {
-                if let PathEvent::Opened { remote_addr, .. } = e {
-                    foreign(peer, &remote_addr);
+                match e {
+                    PathEvent::Opened { remote_addr, .. } => foreign(peer, &remote_addr),
+                    // Events missed: the paths open now stand for them.
+                    PathEvent::Lagged { .. } => weak.upgrade().iter().for_each(open),
+                    _ => {}
                 }
             }
         });
@@ -136,9 +143,6 @@ async fn fall_back(
                         break j;
                     }
                     let up = at(&w.get(), &order[..=k]).is_some();
-                    if up {
-                        until = Instant::now() + grace;
-                    }
                     let left = until.saturating_duration_since(Instant::now());
                     let last = k + 1 == order.len();
                     if !up && !last && left.is_zero() {
@@ -161,6 +165,10 @@ async fn fall_back(
                         Ok(false) => return,
                         Err(_) if blind && (up || last) => break 0,
                         _ => {}
+                    }
+                    // Up until this change at least: a drop's grace starts now.
+                    if up {
+                        until = Instant::now() + grace;
                     }
                 };
                 if let Some(b) = better {
@@ -219,21 +227,25 @@ pub fn wide(c: &Connection) {
 
 /// The lab's first relay (the next ones by [`fallback`]), no third-party
 /// lookup, no captive-portal probes; warns of each relay not the lab's, dialed or on a
-/// path, and refuses each handshake not post-quantum.
+/// path, and refuses each handshake not post-quantum. That refusal follows
+/// the handshake, and 0-RTT (`into_0rtt`) moves data before it: leave it unused.
 pub fn endpoint() -> Builder {
     on(&[])
 }
 
+/// Whether `r` is on this machine: localhost or a loopback address.
+fn local(r: &RelayUrl) -> bool {
+    let h = r.host_str().unwrap_or_default();
+    h.trim_end_matches('.') == "localhost"
+        || h.trim_matches(['[', ']']).parse().is_ok_and(|a: IpAddr| a.is_loopback())
+}
+
 /// [`endpoint`], homed on `relays` in place of the lab's first (none: the
-/// lab's first): a deployment's own. Relays on this machine are met without the
-/// environment's proxy.
+/// lab's first): a deployment's own. Relays all on this machine are met
+/// without the environment's proxy; any other, through it.
 pub fn on(relays: &[RelayUrl]) -> Builder {
     let relays = if relays.is_empty() { self::relays()[..1].to_vec() } else { relays.to_vec() };
-    let local = |r: &RelayUrl| {
-        let h = r.host_str().unwrap_or_default();
-        h.starts_with("127.") || h == "localhost" || h == "[::1]"
-    };
-    let proxied = !relays.iter().any(local);
+    let proxied = !relays.iter().all(local);
     let b = Endpoint::builder(presets::Empty)
         .crypto_provider(tls())
         .transport_config(transport())
@@ -274,6 +286,25 @@ mod tests {
         assert!(!lab(&"https://iroh.cxn.center:9/".parse().unwrap()));
     }
 
+    /// Only relays on this machine skip the proxy, not a name that looks it.
+    #[test]
+    fn only_this_machine_skips_the_proxy() {
+        let is = |s: &str| local(&s.parse().unwrap());
+        for s in [
+            "http://127.0.0.1:3340/",
+            "https://127.1.2.3/",
+            "http://[::1]:9/",
+            "https://localhost./",
+        ] {
+            assert!(is(s), "{s}");
+        }
+        for s in ["https://127.evil.example/", "https://localhost.evil.example/", "https://[::2]/"]
+        {
+            assert!(!is(s), "{s}");
+        }
+        assert!(!RELAYS.iter().chain([&FALLBACK]).any(|s| is(s)));
+    }
+
     /// Each next relay joins only after those before it fail for the grace:
     /// the lab's second, then n0's.
     #[tokio::test(flavor = "multi_thread")]
@@ -290,6 +321,35 @@ mod tests {
         assert!(ep.remove_relay(&order[2]).await.is_none(), "the last, not yet");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(ep.remove_relay(&order[2]).await.is_some(), "then the last");
+        ep.close().await;
+    }
+
+    /// A relay up for longer than the grace drops: the next still waits it out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drop_waits_out_the_grace() {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let mut cfg = ServerConfig::default();
+        cfg.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+        let s = Server::spawn(cfg).await.unwrap();
+        let next: RelayUrl = "https://next.invalid./".parse().unwrap();
+        let order = vec![format!("http://{}/", s.http_addr().unwrap()).parse().unwrap(), next];
+        let ep = on(&order[..1]).bind().await.unwrap();
+        let mut w = ep.home_relay_status();
+        let mut until = async |up: bool| {
+            while w.get().iter().any(|s| s.is_connected()) != up {
+                w.updated().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), until(true)).await.unwrap();
+        let grace = Duration::from_millis(500);
+        tokio::spawn(fall_back(ep.clone(), on, order.clone(), grace));
+        tokio::time::sleep(grace * 3).await;
+        s.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), until(false)).await.unwrap();
+        tokio::time::sleep(grace / 2).await;
+        assert!(ep.remove_relay(&order[1]).await.is_none(), "not before the grace");
+        tokio::time::sleep(grace * 2).await;
+        assert!(ep.remove_relay(&order[1]).await.is_some(), "once it is out");
         ep.close().await;
     }
 
