@@ -125,6 +125,9 @@ mod tests {
         let k = a.complete_hybrid_component(&b.pub_key).unwrap();
         assert_eq!(k.secret_bytes(), b.secret.secret_bytes());
         assert!(Hybrid.start_and_complete(&[0; EK + 31]).is_err());
+        // FIPS 203 7.2's modulus check, which draft-ietf-tls-ecdhe-mlkem requires.
+        let x = X25519.start().unwrap();
+        assert!(Hybrid.start_and_complete(&[&[0xff; EK], x.pub_key()].concat()).is_err());
         assert!(Hybrid.start().unwrap().complete(&[0; CT]).is_err());
         assert_eq!(provider().kx_groups[0].name(), NamedGroup::X25519MLKEM768);
     }
